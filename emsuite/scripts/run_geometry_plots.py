@@ -4,10 +4,9 @@ from __future__ import annotations
 import inspect
 import json
 import math
-import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 
@@ -45,28 +44,40 @@ def _call_with_supported_kwargs(fn, *args, **kwargs):
     return fn(*args, **filtered)
 
 
+def _safe_condensation(G) -> Tuple[Any, Any]:
+    res = G.condensation()
+    if isinstance(res, tuple) and len(res) == 2:
+        return res
+    return res, {}
+
+
 def _make_evo_cfg(wanted: Dict[str, Any]) -> EvolutionConfig:
     """
-    Create EvolutionConfig robustly across schema drift:
-    only pass fields EvolutionConfig.__init__ accepts.
-    Also provide common aliases.
+    Build EvolutionConfig robustly across schema drift:
+    - only pass what the dataclass accepts
+    - apply common aliases, including seed -> random_seed
     """
     sig = inspect.signature(EvolutionConfig)
     allowed = set(sig.parameters.keys())
     filtered = {k: v for k, v in wanted.items() if k in allowed}
 
     aliases = {
-        "population_size": wanted.get("pop_size"),
-        "pop_size": wanted.get("pop_size"),
-        "n_generations": wanted.get("generations"),
-        "generations": wanted.get("generations"),
-        "selection_fraction": wanted.get("elite_fraction"),
-        "elite_fraction": wanted.get("elite_fraction"),
-        "mutation_rate": wanted.get("mutation_rate"),
+        # population aliases
+        "population_size": wanted.get("pop_size") or wanted.get("population_size"),
+        "pop_size": wanted.get("pop_size") or wanted.get("population_size"),
+        # generations aliases
+        "generations": wanted.get("generations") or wanted.get("n_generations"),
+        "n_generations": wanted.get("generations") or wanted.get("n_generations"),
+        # elite fraction aliases
+        "elite_fraction": wanted.get("elite_fraction") or wanted.get("selection_fraction"),
+        "selection_fraction": wanted.get("elite_fraction") or wanted.get("selection_fraction"),
+        # seed aliases
+        "random_seed": wanted.get("seed") if wanted.get("seed") is not None else wanted.get("random_seed"),
         "seed": wanted.get("seed"),
-        "random_seed": wanted.get("seed"),  # reviewer nit: include this alias
+        # size aliases
         "n_nodes": wanted.get("n_nodes"),
     }
+
     for k, v in aliases.items():
         if k in allowed and k not in filtered and v is not None:
             filtered[k] = v
@@ -84,8 +95,13 @@ def main() -> None:
         pop_size=64,
         generations=25,
         elite_fraction=0.25,
-        mutation_rate=0.35,
         seed=0,
+        # add these if your EvolutionConfig supports them (filtered otherwise):
+        projection_mode="coarsen",
+        observers_per_eval=3,
+        observer_pocket_size=1,
+        steps=3,
+        entropy_method="local",
     )
     evo_cfg = _make_evo_cfg(wanted_cfg)
 
@@ -118,7 +134,7 @@ def main() -> None:
     statuses: List[str] = []
     flows: List[Dict[int, float]] = []
 
-    # alpha helper if present
+    # optional helper
     try:
         from emsuite.physics.geometry import alpha_from_g_star  # type: ignore
     except Exception:
@@ -126,10 +142,11 @@ def main() -> None:
 
     for s in range(n_samples):
         G = macro_dag_from_micro_stats(micro, N=N_macro, seed=s)
-        dag, _ = G.condensation()
+        dag, _ = _safe_condensation(G)
 
         res = estimate_g_star(dag, scales=scales)
         statuses.append(res.get("status", "UNKNOWN"))
+
         flow_raw = res.get("flow", {}) or {}
         flow = {int(k): float(v) for k, v in flow_raw.items() if v is not None}
         flows.append(flow)
@@ -142,20 +159,43 @@ def main() -> None:
                 if a is not None:
                     alphas.append(float(a))
 
-        d_mean, slopes, meta = estimate_cone_dimension_paths(dag, r_values=[1, 2, 3, 4, 5, 6], n_targets=10, seed=s)
+        # call cone-dimension estimator defensively
+        d_mean, slopes, meta = _call_with_supported_kwargs(
+            estimate_cone_dimension_paths,
+            dag,
+            r_values=[1, 2, 3, 4, 5, 6],
+            n_targets=10,
+            seed=s,
+        )
         if d_mean is not None:
             dims.append(float(d_mean))
 
     stable_frac = sum(1 for st in statuses if st == "CONVERGED") / len(statuses) if statuses else 0.0
 
+    # include PMFs if present (reviewer-grade traceability)
+    in_pmf = getattr(micro, "in_degree_pmf", None) or getattr(micro, "in_deg_pmf", None) or {}
+    out_pmf = getattr(micro, "out_degree_pmf", None) or getattr(micro, "out_deg_pmf", None) or {}
+    depth_pmf = getattr(micro, "depth_pmf", None) or {}
+    span_pmf = getattr(micro, "edge_span_pmf", None) or {}
+
     out = {
+        "timestamp": stamp,
+        "evolution_config": wanted_cfg,
         "micro_stats": {
-            "avg_out_degree": micro.avg_out_degree,
-            "avg_in_degree": micro.avg_in_degree,
-            "diamond_fraction": micro.diamond_fraction,
-            "cycle_fraction": micro.cycle_fraction,
+            "avg_out_degree": float(getattr(micro, "avg_out_degree", 0.0)),
+            "avg_in_degree": float(getattr(micro, "avg_in_degree", 0.0)),
+            "diamond_fraction": float(getattr(micro, "diamond_fraction", getattr(micro, "diamond_density", 0.0))),
+            "cycle_fraction": float(getattr(micro, "cycle_fraction", 0.0)),
         },
+        "micro_pmfs": {
+            "in_degree_pmf": in_pmf,
+            "out_degree_pmf": out_pmf,
+            "depth_pmf": depth_pmf,
+            "edge_span_pmf": span_pmf,
+        },
+        "N_macro": N_macro,
         "n_samples": n_samples,
+        "scales": scales,
         "g_star_mean": _mean(gstars),
         "g_star_stderr": _stderr(gstars),
         "alpha_mean": _mean(alphas),
@@ -189,7 +229,7 @@ def main() -> None:
         plt.tight_layout()
         plt.savefig(outdir / f"dimension_hist_{stamp}.png", dpi=160)
 
-    # plot mean RG flow
+    # plot mean RG flow with stderr
     if flows:
         by_R: Dict[int, List[float]] = {R: [] for R in scales}
         for f in flows:
@@ -197,16 +237,16 @@ def main() -> None:
                 if R in f:
                     by_R[R].append(float(f[R]))
 
-        xs = []
-        ys = []
-        es = []
+        xs: List[int] = []
+        ys: List[float] = []
+        es: List[float] = []
         for R in scales:
             m = _mean(by_R[R])
             se = _stderr(by_R[R]) or 0.0
             if m is not None:
                 xs.append(R)
-                ys.append(m)
-                es.append(se)
+                ys.append(float(m))
+                es.append(float(se))
 
         if xs:
             plt.figure()
